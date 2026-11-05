@@ -7,7 +7,7 @@ Ranking follows problem_statement.md "Choosing Between Safe Plans" exactly.
 
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import List, Optional, Tuple
 
 from finance.challenge_forecast import (
@@ -18,6 +18,7 @@ from finance.challenge_forecast import (
     lowest_balance,
 )
 
+_CENT = Decimal("0.01")
 MAX_INSTALLMENT_DAY_SLACK = 31  # calendar days per month, upper bound so real months never reject
 
 
@@ -44,6 +45,8 @@ class _Candidate:
     completes_by_deadline: bool
     option_id: str = ""
     changes: Tuple[str, ...] = ()
+    applied: Tuple = ()
+    timeline: Optional[List[Tuple]] = None
 
     def rank_key(self):
         return (0 if self.completes_by_deadline else 1, 0 if not self.changes else 1,
@@ -105,38 +108,66 @@ def _try_full_payment_with_changes(balance0, timeline, flexible, min_balance, re
     return [], timeline
 
 
-def _explain(request, safe_now, min_balance, decision, earliest_full):
-    parts = [
-        (f"Requested {request.requested_amount} on {request.request_date}; "
-         f"90-day forecast keeps a minimum balance of {min_balance}."),
-        f"Amount safe to pay today before any spending changes: {safe_now}.",
-    ]
-    if decision.recommended_payment_method == "full_payment":
-        parts.append("The full amount is safe to pay today.")
-    elif decision.recommended_payment_method == "partial_payment":
-        parts.append(
-            f"Only part of the amount is safe today; the remainder is safe on "
-            f"{decision.earliest_date_for_full_payment}."
-        )
-    elif decision.recommended_payment_method == "installments":
-        parts.append("A supplied installment option stays within the safe balance throughout its schedule.")
-    elif decision.recommended_payment_method == "wait":
-        parts.append(f"Full payment is not safe until {earliest_full}.")
-    else:
-        parts.append("No accepted payment method stays safe within the 90-day forecast.")
-    if decision.spending_changes:
-        parts.append(f"Requires stopping/reducing: {', '.join(decision.spending_changes)}.")
-    return " ".join(parts)
+def _money(profile, amount) -> str:
+    currency = getattr(profile, "home_currency", None) or ""
+    cents = Decimal(amount).quantize(_CENT, rounding=ROUND_HALF_UP)
+    text = f"{cents:,.2f}"
+    if text.endswith(".00"):
+        text = text[:-3]
+    return f"{currency} {text}".strip()
 
 
-def decide_request(context, facts_by_event=None, horizon_days=90) -> ChallengeDecision:
+def _day(value) -> str:
+    return f"{value.day} {value.strftime('%B %Y')}"
+
+
+def _change_phrase(candidate, profile) -> str:
+    label = (candidate.category or candidate.event_id).replace("_", " ")
+    if candidate.action == "stop":
+        return f"stop the {label} payment ({candidate.event_id})"
+    return f"reduce the {label} payment ({candidate.event_id}) to {_money(profile, candidate.reduced_amount)}"
+
+
+def _explain(request, profile, safe_now, decision, lowest_after, applied=()):  # noqa: PLR0911, PLR0913, PLR0917
+    """One or two plain-language sentences grounded in the forecast numbers."""
+    amount = _money(profile, request.requested_amount)
+    minimum = _money(profile, profile.minimum_balance_to_keep)
+    method = decision.recommended_payment_method
+    plan = decision.payment_plan
+    keeps = (f"This leaves at least {_money(profile, lowest_after)} available over the next 90 days."
+             if lowest_after is not None else f"This keeps the {minimum} minimum protected.")
+    if method == "full_payment" and applied:
+        changes = " and ".join(_change_phrase(item, profile) for item in applied)
+        return f"{changes[0].upper()}{changes[1:]}, then pay {amount} today. {keeps}"
+    if method == "full_payment":
+        return f"Pay {amount} today. {keeps}"
+    if method == "installments":
+        return (f"Use {len(plan)} installments of {_money(profile, plan[0][1])}, starting "
+                f"{_day(plan[0][0])}. {keeps}")
+    if method == "partial_payment":
+        return (f"Pay {_money(profile, plan[0][1])} today and the remaining {_money(profile, plan[1][1])} "
+                f"on {_day(plan[1][0])}. This completes the full request and keeps the {minimum} minimum protected.")
+    if method == "wait":
+        return (f"Pay {amount} in full on {_day(plan[0][0])}. Paying earlier would take the balance "
+                f"below the {minimum} minimum.")
+    if safe_now > 0:
+        return (f"Do not proceed with the {amount} request. Although {_money(profile, safe_now)} is "
+                f"available today, the full amount cannot be completed safely within 90 days.")
+    return (f"Do not make this payment by {_day(request.desired_completion_date)}. None of the available "
+            f"options keeps the {minimum} minimum protected.")
+
+
+def decide_request(context, facts_by_event=None, horizon_days=90, adjustments=()) -> ChallengeDecision:
     """Compute the full challenge decision for one loaders.dataset.RequestContext."""
     request, profile = context.request, context.profile
     start = request.request_date
     end = start + timedelta(days=horizon_days)
-    timeline, flexible = build_timeline(context.events, profile, start, end, facts_by_event)
+    timeline, flexible = build_timeline(context.events, profile, start, end, facts_by_event,
+                                        adjustments=adjustments)
     balance0, min_balance = profile.current_available_balance, profile.minimum_balance_to_keep
-    safe_now = amount_safe_to_pay(balance0, timeline, min_balance, request.requested_amount)
+    # Round down to the cent: a safe amount must never be overstated.
+    safe_now = amount_safe_to_pay(balance0, timeline, min_balance, request.requested_amount).quantize(
+        _CENT, rounding=ROUND_DOWN)
     earliest_full = earliest_full_payment_date(
         balance0, timeline, request.requested_amount, min_balance, start, end
     )
@@ -168,21 +199,28 @@ def decide_request(context, facts_by_event=None, horizon_days=90) -> ChallengeDe
             earliest_full <= request.desired_completion_date,
         ))
 
-    if not candidates and "full_payment" in accepted:
-        applied, _adjusted = _try_full_payment_with_changes(
+    # Spending changes are ranked against every other plan (rule 1, completing by
+    # the deadline, outranks rule 2, avoiding changes), so try them whenever a
+    # plain full payment today is not already safe.
+    if earliest_full != start and "full_payment" in accepted:
+        applied, adjusted = _try_full_payment_with_changes(
             balance0, timeline, flexible, min_balance, request.requested_amount
         )
         if applied:
             candidates.append(_Candidate(
                 "affordable_with_plan", "full_payment", [(start, request.requested_amount)],
                 request.requested_amount, start, 1, True, changes=_spending_changes_tokens(applied),
+                applied=tuple(applied), timeline=adjusted,
             ))
 
-    if candidates:
-        winner = min(candidates, key=_Candidate.rank_key)
+    winner = min(candidates, key=_Candidate.rank_key) if candidates else None
+    if winner is not None:
         status, method, plan, changes = winner.status, winner.method, winner.plan, winner.changes
+        effective = winner.timeline if winner.timeline is not None else timeline
+        lowest_after = lowest_balance(balance0, [*effective, *((when, -paid) for when, paid in plan)])
     else:
         status, method, plan, changes = "not_affordable", "not_recommended", [], ()
+        lowest_after = None
 
     decision = ChallengeDecision(
         request_id=request.request_id, amount_safe_to_pay=safe_now, affordability_status=status,
@@ -190,5 +228,6 @@ def decide_request(context, facts_by_event=None, horizon_days=90) -> ChallengeDe
         earliest_date_for_full_payment=earliest_full, spending_changes=changes,
         decision_explanation="",
     )
-    explanation = _explain(request, safe_now, min_balance, decision, earliest_full)
+    explanation = _explain(request, profile, safe_now, decision, lowest_after,
+                           winner.applied if winner is not None else ())
     return replace(decision, decision_explanation=explanation)

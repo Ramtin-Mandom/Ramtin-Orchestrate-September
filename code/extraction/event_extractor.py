@@ -181,7 +181,7 @@ def _openai_request(*, model, content, schema, trusted):
 def _sdk_response(factory, key, model, content, schema, trusted):  # noqa: PLR0913, PLR0917 -- SDK call boundary
     with factory(api_key=key, max_retries=0, timeout=60) as client:
         response = client.chat.completions.create(
-            model=model,
+            model=model, temperature=0, seed=7,  # as repeatable as the API allows
             messages=[
                 {"role": "system", "content": PROMPT},
                 {"role": "system", "content": _trusted_context_content(trusted)},

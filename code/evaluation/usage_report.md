@@ -1,64 +1,63 @@
 # Token usage and cost report
 
-This report covers the run that produced the submitted `output.csv`:
+This report covers the full-dataset run (250 evaluation requests) that
+produced `output.csv`, with the LLM steps enabled:
 
-```powershell
-python code/main.py --dataset dataset --output output.csv
+```bash
+python code/main.py --use-ai-extraction --output output.csv
 ```
 
-## Model calls
+## Model
 
-| Provider | Model | Calls | Input tokens | Output tokens | Total tokens |
-| --- | --- | --- | --- | --- | --- |
-| — | — | 0 | 0 | 0 | 0 |
+| Provider | Model | Used for |
+|---|---|---|
+| OpenAI | `gpt-4o-mini` | (1) interpreting user-level messages into typed cash-flow adjustments (`extraction/message_interpreter.py`); (2) extracting facts about one specific event from its linked message or receipt image (`extraction/event_extractor.py`) |
 
-**No model calls were made for this run.** AI extraction
-(`extraction.event_extractor.extract_event_facts`) is implemented and tested
-(see `tests/test_event_extractor.py`), but it is opt-in via `--use-ai-extraction`
-and stays off by default so that a submission never makes billable calls
-without an explicit choice, and no `OPENAI_API_KEY` is configured in this
-environment. Every decision in the submitted `output.csv` was produced
-deterministically from `dataset/*.csv` alone: `extraction.event_reconciliation`
-reconciles each event against zero AI facts, which is a no-op identity pass
-over the CSV record (see `challenge_pipeline._collect_facts`, only invoked
-when `use_ai_extraction=True`).
+Both calls use temperature 0, a fixed seed and strict JSON-schema output. The
+model never computes amounts or chooses recommendations. Every number in
+`output.csv` comes from deterministic code.
 
-Total / average tokens per request: **N/A (0 requests used a model call)**.
-Estimated total and per-request cost: **$0.00** for this run.
+## Calls and tokens
 
-## Effect of skipping AI extraction
+| Run | Model calls | Input tokens | Output tokens | Total tokens |
+|---|---|---|---|---|
+| **Full run, cold cache** (every message and image sent to the model) | **209** | **486,587** | **14,614** | **501,201** |
+| Final run that wrote `output.csv` (message interpretations served from `.cache/`; only event-level extractions re-sent) | 47 | 361,531 | 4,950 | 366,481 |
 
-Scanning `dataset/financial_events.csv`, `dataset/messages.csv` and
-`dataset/images.csv` directly:
+How the cold-cache calls break down:
+- **162 calls** to the message interpreter, about 125K input tokens. These are
+  short text prompts.
+- **47 calls** to the event extractor, about 362K input tokens. Most of those
+  tokens are the 16 receipt images, which cost about 19K input tokens each.
 
-- 25,342 financial events total; **16** have a blank `amount`.
-- 215 messages and 16 images; **39** messages and **16** images carry a
-  `related_event_id` (i.e. describe one specific event).
-- **19** of those event-linked messages/images point at one of the 16
-  blank-amount events (the rest describe lifecycle facts — cancellations,
-  settlements, amendments, delays — for events that already have an amount).
+Per request (cold cache, 250 requests):
+- **0.84 model calls**
+- **2,005 tokens** on average (1,946 input and 58 output)
 
-Without AI extraction, those 16 blank-amount events are excluded from every
-affected user's 90-day cash-flow timeline (`finance.challenge_forecast` never
-invents an amount), and any cancellation/settlement/amendment described only
-in a message or image is not applied — the CSV `status`/`amount` is used
-as-is. This is a conservative, documented simplification, not a silent gap.
+## Estimated cost
 
-## Running with AI extraction enabled
+Priced at OpenAI's published `gpt-4o-mini` list rates of **$0.15 per 1M
+input tokens** and **$0.60 per 1M output tokens** (check current pricing):
 
-```powershell
-$env:OPENAI_API_KEY = "sk-..."
-python code/main.py --dataset dataset --output output.csv --use-ai-extraction
-```
+| Run | Input cost | Output cost | Total | Per request |
+|---|---|---|---|---|
+| Full run, cold cache | $0.0730 | $0.0088 | **$0.082** | **$0.00033** |
+| Final run (message cache warm) | $0.0542 | $0.0030 | $0.057 | $0.00023 |
 
-This calls `extract_event_facts` once per (event, evidence-set) — the pipeline
-caches by event_id plus the exact visible message/image IDs, so the same
-event is never re-extracted across a user's multiple requests
-(`challenge_pipeline._collect_facts`). With `OPENAI_MODEL` unset, the default
-production model is `gpt-4o-mini`. Based on the ~55 unique event/evidence
-pairs above (upper bound before caching collapses repeats), expect on the
-order of 55 calls; re-run with `--use-ai-extraction` and re-generate this
-table with the true `UsageRecord` totals from
-`ChallengePipelineResult.usage` (provider, model, input/output tokens, and
-call success are recorded for every call, successful or not) before
-resubmitting if you choose to enable it.
+The 25-request public sample run (`--evaluate-samples --use-ai-extraction`)
+used 22 calls when cold (166,869 input / 1,809 output tokens, about $0.026).
+
+## Effect of the LLM steps (25 public samples)
+
+| Field | Rules only | Rules + LLM |
+|---|---|---|
+| affordability_status | 80% | **88%** |
+| recommended_payment_method | 88% | **96%** |
+| earliest_date_for_full_payment | 67% | **72%** |
+
+Without `--use-ai-extraction` the pipeline makes **zero** model calls, costs
+nothing and still produces a complete `output.csv`.
+
+No API keys, credentials or other sensitive configuration are included in
+this repository. The key is read from the `OPENAI_API_KEY` environment
+variable only.

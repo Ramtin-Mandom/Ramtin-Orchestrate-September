@@ -226,3 +226,6 @@ dataset/
 
 # Chat transcript log (AGENTS.md Sec. 2/5) - uploaded at submission time, not committed
 log.txt
+
+# Cached LLM interpretations (re-runs are free and reproducible)
+.cache/

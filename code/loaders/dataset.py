@@ -40,6 +40,7 @@ class LoadedDataset:
     sample_requests: Tuple[ChallengeRequest, ...]
     sample_outputs: Tuple[SourceRecord, ...]
     tables: dict
+    sample_contexts: Tuple[RequestContext, ...] = ()
 
 
 def index_unique(items, key, label):
@@ -160,13 +161,16 @@ def load_dataset(root="dataset"):
     options = group(tables["request_payment_options"], "request_id")
     messages = group(tables["messages"], "user_id")
     images = group(tables["images"], "user_id")
-    contexts = []
-    for request in evaluation:
+
+    def context_for(request):
         profile = profiles[request.user_id]
         relevant_messages = tuple(r for r in messages[request.user_id] if r.request_id in (None, request.request_id))
         relevant_images = tuple(r for r in images[request.user_id] if r.request_id in (None, request.request_id))
         event_messages = group(relevant_messages, "related_event_id")
         event_images = group(relevant_images, "related_event_id")
         converted = tuple(convert_event(e, profile, rates, event_messages[e.event_id], event_images[e.event_id]) for e in by_user[request.user_id])
-        contexts.append(RequestContext(request, profile, converted, tuple(options[request.request_id]), relevant_messages, relevant_images))
-    return LoadedDataset(tuple(contexts), samples, load_sample_outputs(sample_rows), tables)
+        return RequestContext(request, profile, converted, tuple(options[request.request_id]), relevant_messages, relevant_images)
+
+    contexts = tuple(context_for(request) for request in evaluation)
+    sample_contexts = tuple(context_for(request) for request in samples)
+    return LoadedDataset(contexts, samples, load_sample_outputs(sample_rows), tables, sample_contexts)
