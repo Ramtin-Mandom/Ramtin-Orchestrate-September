@@ -14,9 +14,12 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
 
 from decision.challenge_decision import ChallengeDecision, decide_request
+from evaluation.metrics import EvaluationReport, evaluate_predictions
 from extraction.event_extractor import UsageRecord, extract_event_facts
+from extraction.message_interpreter import MessageInterpreter
 from loaders import load_dataset
-from output.challenge_writer import write_challenge_csv
+from loaders.dataset_schema import HEADERS
+from output.challenge_writer import challenge_row, write_challenge_csv
 
 PathLike = Union[str, Path]
 
@@ -58,10 +61,10 @@ def _collect_facts(context, extractor: Optional[Callable], cache: dict, usage: l
     return facts_by_event
 
 
-def run_challenge_pipeline(
+def run_challenge_pipeline(  # noqa: PLR0913 -- public pipeline entry point
     dataset_root: PathLike, output_path: PathLike, *,
     use_ai_extraction: bool = False, extractor: Optional[Callable] = None,
-    horizon_days: int = 90,
+    horizon_days: int = 90, interpreter: Optional[MessageInterpreter] = None,
 ) -> ChallengePipelineResult:
     """Load the challenge dataset, decide every request, and write output_path.
 
@@ -73,13 +76,48 @@ def run_challenge_pipeline(
     correct for events with no lifecycle changes described in media).
     """
     dataset = load_dataset(dataset_root)
-    decisions = []
-    usage: list = []
-    cache: dict = {}
-    for context in dataset.contexts:
-        facts_by_event = {}
-        if use_ai_extraction:
-            facts_by_event = _collect_facts(context, extractor, cache, usage)
-        decisions.append(decide_request(context, facts_by_event, horizon_days))
+    decisions, usage = _decide_all(dataset.contexts, use_ai_extraction, extractor, interpreter, horizon_days)
     write_challenge_csv(decisions, output_path)
     return ChallengePipelineResult(tuple(decisions), tuple(usage))
+
+
+def _decide_all(contexts, use_ai_extraction, extractor, interpreter, horizon_days):
+    """Decide each context; with AI on, add event facts and message adjustments."""
+    usage: list = []
+    cache: dict = {}
+    if use_ai_extraction and interpreter is None:
+        interpreter = MessageInterpreter()
+    decisions = []
+    for context in contexts:
+        facts_by_event, adjustments = {}, ()
+        if use_ai_extraction:
+            facts_by_event = _collect_facts(context, extractor, cache, usage)
+            adjustments = interpreter.adjustments_for(context)
+        decisions.append(decide_request(context, facts_by_event, horizon_days, adjustments))
+    if use_ai_extraction:
+        interpreter.save()
+        usage.extend(interpreter.usage)
+    return decisions, usage
+
+
+def evaluate_samples(  # noqa: PLR0913 -- public evaluation entry point
+    dataset_root: PathLike, output_path: Optional[PathLike] = None, *, horizon_days: int = 90,
+    use_ai_extraction: bool = False, extractor: Optional[Callable] = None,
+    interpreter: Optional[MessageInterpreter] = None,
+) -> Tuple[EvaluationReport, Tuple[UsageRecord, ...]]:
+    """Decide every public sample request and score it against its published answer.
+
+    `sample_requests.csv` ships with completed output fields, so this is the
+    project's offline accuracy check. It never touches the evaluation requests,
+    and optionally writes the sample predictions for side-by-side inspection.
+    """
+    dataset = load_dataset(dataset_root)
+    decisions, usage = _decide_all(dataset.sample_contexts, use_ai_extraction, extractor, interpreter,
+                                   horizon_days)
+    if output_path is not None:
+        write_challenge_csv(decisions, output_path)
+    columns = HEADERS["output"]
+    predicted = [dict(zip(columns, challenge_row(decision))) for decision in decisions]
+    expected = [{column: record.values.get(column, "") or "" for column in columns}
+                for record in dataset.sample_outputs]
+    return evaluate_predictions(predicted, expected), tuple(usage)

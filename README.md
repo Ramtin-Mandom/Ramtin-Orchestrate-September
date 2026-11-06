@@ -1,321 +1,213 @@
-# Buy or Wait
+# Buy or Wait? — an AI agent that decides whether a purchase is safe
 
-A Python implementation of the “Buy or Wait” financial-affordability challenge:
-use supplied CSV data and local text/images to assess a requested purchase,
-protect a required reserve, and explain a deterministic recommendation. The
-writer generates the challenge's exact-column `output.csv` without hardcoded
-challenge answers. See [problem_statement.md](problem_statement.md) for the
-full challenge specification.
+Given a person's bank history, their payment preferences and the messages they
+receive ("your salary drops to EUR 1,422 next month", "the lease renewal raises
+rent by 12%"), the agent answers one question for every purchase request:
 
-The default workflow loads the exact challenge dataset, validates all nine CSVs,
-joins per-request contexts, reconciles each financial event's lifecycle
-(cancellations, settlements, amendments, delays, blank-amount resolution),
-runs a 90-day cash-flow forecast, selects a deterministic recommendation, and
-writes the exact-schema `output.csv`. AI extraction from messages/images is
-opt-in (`--use-ai-extraction`); by default reconciliation runs against the
-CSV facts alone, so a run never makes a billable call unless asked. The older
-synthetic decision pipeline is available only with `--mode legacy`.
+> **Can I afford this — and if so, how should I pay?**
 
-## Pipeline and architecture
+For each request it says whether the purchase is **affordable now**, **affordable
+with a plan** (installments, a partial payment, or cutting a flexible expense),
+**affordable later** (and on which date), or **not affordable**. It explains why
+in one plain sentence:
 
-CSV loading/joining → (optional) AI event-fact extraction → deterministic
-event reconciliation → 90-day cash-flow forecast → payment-method/plan
-selection and ranking → ordered CSV output.
+```text
+request_31  affordable_later      wait
+  "Pay IDR 18,164,000 in full on 15 November 2024. Paying earlier would take the balance below the IDR 16,588,900 minimum."
 
-AI extracts source-traceable facts only, scoped to one financial event at a
-time, with trusted identity (request/user/event ID, request date, home
-currency) passed separately from untrusted message/image content. It neither
-chooses recommendations nor calculates affordability — every number in
-`output.csv` comes from `finance/challenge_forecast.py` and
-`decision/challenge_decision.py`. Evaluation and model experiments run
-separately and never modify production configuration.
+request_46  affordable_with_plan  installments
+  "Use 2 installments of INR 25,714, starting 3 December 2024. This leaves at least INR 135,107.05 available over the next 90 days."
+
+request_56  affordable_with_plan  partial_payment
+  "Pay USD 667.49 today and the remaining USD 214.07 on 15 February 2025. This completes the full request and keeps the USD 2,100 minimum protected."
+```
+
+(These rows are real output from the final run.)
+
+Built for the HackerRank Orchestrate "Buy or Wait?" challenge (September 2026).
+The full specification is in [problem_statement.md](problem_statement.md).
+
+## How it decides
+
+```mermaid
+flowchart LR
+    A[CSV data<br/>profiles · events · rates<br/>payment options] --> B[Load & validate<br/>convert currencies]
+    M[Messages & images<br/>untrusted] --> L{{LLM<br/>gpt-4o-mini}}
+    L -- typed, validated facts --> C
+    B --> C[Reconcile events<br/>cancellations · settlements<br/>amendments · duplicates]
+    C --> D[Detect recurring<br/>income & bills]
+    D --> E[90-day cash-flow<br/>forecast]
+    E --> F[Score every eligible plan<br/>full · partial · installments<br/>wait · spending cuts]
+    F --> G[output.csv<br/>decision + explanation]
+```
+
+1. **Load.** It reads nine CSVs, validates every reference and converts
+   foreign-currency events using the exact dated exchange rate.
+2. **Reconcile.** Each transaction's lifecycle is resolved, including
+   cancellations, settlements, amendments, reversed charges and duplicates.
+   Unrealized investment gains and pending credits never count as cash.
+3. **Find what repeats** ([`finance/recurrence.py`](code/finance/recurrence.py)).
+   Rent on the 2nd, groceries every 7 or 10 days and salary on the 15th are
+   detected from history and projected forward:
+   - A series must have a regular rhythm and must not have missed its latest
+     occurrence. A cancelled subscription or a stopped second income is not
+     projected.
+   - Bills are reserved at the mean of their last three amounts, rounded up.
+   - Gig payouts whose amount swings are *not* treated as dependable salary.
+     A payroll marked "final" ends the income.
+4. **Read the messages (the AI part).** An LLM turns each message into typed
+   adjustments such as `salary_amount`, `salary_date`, `income_ended`,
+   `confirmed_income`, `expense_amount` and `new_recurring_expense`. It reads
+   English and Indonesian.
+   - It does **not** decide affordability. It only restates facts, which plain
+     code then validates and applies
+     ([`extraction/message_interpreter.py`](code/extraction/message_interpreter.py),
+     [`finance/adjustments.py`](code/finance/adjustments.py)).
+   - Messages tied to one transaction, and receipt images, go through a
+     separate per-event extractor.
+5. **Forecast 90 days.** It builds a day-by-day balance and checks that it
+   never falls below the user's chosen minimum.
+6. **Choose a plan** ([`decision/challenge_decision.py`](code/decision/challenge_decision.py)).
+   Every plan the user accepts is checked against the forecast:
+   - pay in full today
+   - pay part today and the rest later
+   - each seller installment option
+   - wait for a later date
+   - stop or reduce up to three flexible expenses
+
+   Safe plans are then ranked by the challenge rules: finish by the deadline,
+   then need no spending cuts, then lowest total cost, then start earliest,
+   then use the fewest payments.
+
+### Treating messages as untrusted
+
+Messages and images come from outside the system, and some try to steer the
+agent. The pipeline is built so they can't:
+
+- **Separate trusted context.** The request date, home currency and known
+  categories travel in their own system message. They are never read back from
+  model output.
+- **Strict output.** The model must answer with a strict JSON schema, and
+  anything malformed is dropped. Unknown categories, amounts in another
+  currency and items missing a required date are also dropped.
+- **No look-ahead.** A message dated after the request is never used.
+- **Unconfirmed money doesn't count.** Pending bonuses, unapproved commissions,
+  refunds still processing and prize claims are ignored.
+- **Cached and repeatable.** Results are cached by message text, model and
+  prompt version, so a re-run makes no new calls and gives the same answers.
+
+## Results
+
+The challenge publishes 25 sample requests with reference answers, and
+`python code/main.py --evaluate-samples` scores the agent against them. The
+250 evaluation requests are scored only by the organisers, against hidden
+answers.
+
+| Field (25 public samples) | Start of this iteration | + recurrence detection | + LLM message reading |
+|---|---|---|---|
+| `affordability_status` | 48% | 80% | **88%** |
+| `recommended_payment_method` | 56% | 88% | **96%** |
+| `earliest_date_for_full_payment` | 22% | 67% | **72%** |
+| `amount_safe_to_pay` (exact to the cent) | 16% | 16% | 16% |
+
+Across the 250 evaluation requests, the final run recommends:
+
+| Recommendation | Requests |
+|---|---|
+| Pay in full now | 69 |
+| Wait for a safe date | 57 |
+| Installments | 55 |
+| Partial payment now and the rest later | 8 |
+| Don't proceed | 61 |
+
+The submission before this iteration had 103 "not affordable" verdicts and
+only 8 "wait" verdicts. It ignored future salary, so later affordability was
+almost never detected.
+
+The exact safe amount is the hardest field. The reference generator's internal
+forecasting assumptions are not published. The agent's amounts are usually
+close, but rarely identical to the cent. The full-dataset AI run used **209 `gpt-4o-mini` calls, about 501K tokens and
+about $0.08** in total, roughly 2K tokens and $0.0003 per request. Details are
+in [`code/evaluation/usage_report.md`](code/evaluation/usage_report.md). A
+plain-language walkthrough of how the agent was built is in
+[agent_summary.md](agent_summary.md).
+
+## Run it
+
+Requires Python 3.8+.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Place the challenge data in `dataset/`. It is not redistributed in this repo;
+see [problem_statement.md](problem_statement.md) for the layout. Then:
+
+```bash
+python code/main.py                       # rules only: free, offline, deterministic
+python code/main.py --evaluate-samples    # score against the 25 public answers
+```
+
+To turn on the LLM step, set `OPENAI_API_KEY` in your environment, then:
+
+```bash
+python code/main.py --use-ai-extraction
+python code/main.py --evaluate-samples --use-ai-extraction
+```
+
+`OPENAI_MODEL` overrides the default `gpt-4o-mini`. Interpretations are cached
+in `.cache/`, so later runs are free.
+
+Tests and lint run fully offline, with every model call mocked:
+
+```bash
+python -m pytest -q
+python -m ruff check .
+```
+
+## Project layout
 
 ```text
 code/
-  main.py                 CLI entry point
-  challenge_pipeline.py   challenge-mode orchestration (load -> reconcile -> forecast -> decide -> write)
-  pipeline.py             legacy-mode orchestration and request-failure records
-  logging_config.py       safe, configurable stderr logging
-  models/                 typed records; Decimal money
-  loaders/                CSV loading, dataset joining, media discovery
-  extraction/             normalization, AI extraction (legacy + per-event), reconciliation, profile merging
-  finance/                legacy forecasts/plans, and challenge_forecast.py (90-day cash flow, spending-change search)
-  decision/               legacy recommendation selection, and challenge_decision.py (ranking, plan/method selection)
-  output/                 exact-schema CSV writers (legacy and challenge)
-  evaluation/             reference evaluation, optional model experiment, usage_report.md
-tests/                    offline unit and integration tests
-requirements.txt          pytest, Ruff, official OpenAI SDK
-.env.example              placeholders; never real credentials
-ruff.toml                 lint settings; Python 3.8 target
-problem_statement.md      authoritative challenge specification
+  main.py                     CLI entry point
+  challenge_pipeline.py       load → (AI) → reconcile → forecast → decide → write; sample scoring
+  loaders/                    CSV schemas, validation, currency conversion, per-request contexts
+  extraction/
+    message_interpreter.py    LLM: user-level messages → typed cash-flow adjustments
+    event_extractor.py        LLM: event-linked messages/receipt images → event facts
+    event_reconciliation.py   deterministic lifecycle resolution (cancel/settle/amend/delay)
+  finance/
+    recurrence.py             recurring income/expense detection and projection
+    adjustments.py            applies message adjustments to the projections
+    challenge_forecast.py     90-day timeline, safe amount, earliest safe date, spending cuts
+  decision/challenge_decision.py   plan generation, ranking, explanations
+  output/challenge_writer.py  exact-schema output.csv
+  evaluation/                 metrics, sample scoring, usage report
+tests/                        offline unit + integration tests (models mocked)
+docs/technical-reference.md   CLI options, data formats, safety and failure behaviour
 ```
 
-Data must be supplied locally; `data/` and `dataset/` are ignored by Git.
+`--mode legacy` runs an earlier, synthetic-format prototype that is kept for
+reference; see the technical reference.
 
-## Setup
+## Limitations
 
-Run commands from the repository root. Application code targets Python 3.8+
-(the offline suite was verified on Python 3.8.2); prefer a maintained Python
-version for new installations. Dependency versions are not fully pinned.
+- Spending that repeats less often than every 10 days (other than monthly) is
+  not projected. In this data those habits were too irregular to reserve
+  reliably.
+- Spending cuts are searched only to make a full payment possible today.
+  Combinations with installments or partial payments are not explored. On
+  this dataset the forecast usually finds a cheaper safe plan without cuts, so
+  no evaluation row recommends one. The reference answers use cuts in 3 of the
+  25 samples.
+- Amounts in messages are applied only when they are in the user's home
+  currency. No dated exchange rate exists for them, so they are never
+  converted by guesswork.
+- The 25 public samples are a small benchmark. The rules were chosen to be
+  defensible from the specification, not tuned until every sample matched.
 
-Windows PowerShell:
+## License
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-On macOS/Linux, activate the environment with `source .venv/bin/activate`.
-Upgrade pip before installing dependencies: older bundled resolvers can select
-SDK dependencies incompatible with Python 3.8.
-The SDK is used only for live media extraction. Tests and no-media runs do not
-require credentials or network access.
-
-## Environment configuration
-
-Variables are read from the process environment. **`.env` is not automatically
-loaded**; copying `.env.example` alone does not configure the application.
-Set credentials securely in the shell or your environment manager and never
-commit them.
-
-| Variable | Purpose / default |
-| --- | --- |
-| `OPENAI_API_KEY` | Required for live extraction; no default |
-| `OPENAI_MODEL` | Production extraction model; `gpt-4o-mini` when unset/blank |
-| `OPENAI_EXPERIMENT_MODEL` | Explicit alternative for the optional experiment; no default |
-| `PYTHONPATH` | Set to `code` for the evaluation module commands below |
-
-A custom extraction model must support image input and strict JSON-schema output.
-Log level is configured by the CLI, not a dedicated environment variable.
-
-## Input and execution
-
-From the repository root with the virtual environment active, run:
-
-```powershell
-python code/main.py
-```
-
-This reads `dataset/requests.csv`, `sample_requests.csv`, `financial_profiles.csv`,
-`financial_events.csv`, `exchange_rates.csv`, `request_payment_options.csv`,
-`messages.csv`, `images.csv`, and the blank `output.csv` template (validated,
-never written to), then writes one completed row per `requests.csv` row to
-`output.csv` (default: repository-root `output.csv`, not the dataset
-template). Use `python code/main.py --dataset PATH --output PATH` to change
-either location, and `--use-ai-extraction` to also resolve blank amounts and
-lifecycle changes from messages/images (requires `OPENAI_API_KEY`; off by
-default so a run is always free and deterministic). `requested_amount` is the
-request amount; no custom `amount` column is required.
-
-The Python API is `loaders.load_dataset(path)`. Its `contexts` follow evaluation
-request order and contain the typed request, profile, events, payment options,
-messages, and images. Each source record retains original fields, IDs and file/row
-provenance. Examples remain separate. User evidence with a blank `request_id`
-applies to every request for that user; explicit request evidence stays with that
-request. Event-linked evidence is also attached to its exact event. Images resolve
-to `media/images/<image_id>.png`; missing files fail validation.
-
-Foreign event amounts and minimum allowed amounts convert into `home_currency`
-using an exact supplied `(settlement_date, from_currency, to_currency)` match.
-Rows without settlement dates use `event_date`. No earlier-rate fallback, inverse,
-triangulation or live rate is used. Decimal multiplication is exact and unrounded;
-missing rates raise validation errors. Original currency amounts and the selected
-rate provenance remain available. Blank event amounts remain unknown.
-
-### Separate legacy compatibility mode
-
-The following synthetic format and decision behavior apply only to `--mode legacy`.
-
-
-The supported CSV is UTF-8 (an optional BOM is accepted), with unique headers.
-Required row values are:
-
-- `request_id`: nonempty and unique across the batch.
-- `amount`: finite, nonnegative decimal purchase amount; zero is allowed.
-- `account_balance` or `current_balance`: known balance; conflicting aliases fail.
-- `minimum_balance` or `preferred_balance`: an explicit nonnegative reserve.
-- `request_date`: `YYYY-MM-DD`, unless `--as-of-date` supplies it globally.
-
-Optional purchase fields: `description`, `desired_date`, and
-`preferred_payment_method`. Optional profile scalars: `currency`,
-`savings_balance`, and either reserve field. Collection cells are JSON arrays:
-`incomes`, `pending_payments`, `transactions`, `recurring_expenses`,
-`essential_expenses`, and `flexible_expenses`. Every collection entry requires
-`amount`; other keys use the dataclasses in `code/models/records.py`, such as
-`expected_date` for income and `next_due_date` for expenses. Unknown entry fields
-are rejected. Quote JSON correctly as CSV content; absent collections are empty.
-
-For a small **synthetic no-media example**, create `data/requests.csv`:
-
-```csv
-request_id,amount,account_balance,minimum_balance,request_date,description
-example-1,25,100,20,2026-09-12,Example purchase
-```
-
-Then run:
-
-```powershell
-python code/main.py --mode legacy --input data/requests.csv --media-root data/media --output data/output.csv
-```
-
-This executes the full pipeline and writes `data/output.csv`. The default output
-location is root `output.csv`; the destination's parent directory must exist.
-Existing destination files are overwritten.
-
-| CLI option | Default / behavior |
-| --- | --- |
-| `--mode` | `challenge`; `legacy` enables the synthetic runner |
-| `--dataset` | `dataset`; challenge CSV directory |
-| `--input` (legacy) | `dataset/requests.csv` |
-| `--media-root` / `--media` (legacy) | `dataset/media` |
-| `--output` | `output.csv` |
-| `--use-ai-extraction` (challenge) | Off by default; needs `OPENAI_API_KEY` when set |
-| `--as-of-date` (legacy) | No override; use each row's `request_date` |
-| `--horizon-days` | Positive integer; 90, ending inclusively 90 days after the start |
-| `--log-level` | `INFO`; also `DEBUG`, `WARNING`, `ERROR`, `CRITICAL` |
-
-Media references are `media_path`, `message_path`, `image_path`, or `media_paths`
-(a JSON array of path strings). Paths must resolve inside the media root;
-referenced directories are searched recursively. Without explicit references,
-association uses an exact request-ID directory or root-level filename stem.
-Text supports UTF-8 `.txt`, `.md`, `.json`; images support `.png`, `.jpg`, `.jpeg`,
-`.webp`, with a 10 MiB limit per file. No OCR library is used. A supported-media
-run may make billable OpenAI calls; the client is initialized lazily.
-
-Output columns, exactly in this order:
-
-```text
-request_id,amount_safe_to_pay,affordability_status,recommended_payment_method,payment_plan,earliest_date_for_full_payment,spending_changes_needed,decision_explanation
-```
-
-Money is serialized as plain decimal text without locale formatting; dates use
-ISO format. Plans use `date:amount|...`, absent plans/changes use `none`, and absent
-optional dates/explanations are blank. Spending changes require actual source event
-IDs and use `stop:event_id` or `reduce_to:event_id:amount` (at most three). CSV
-quoting handles commas, quotes, and newlines. Internal strategy names map to the
-required output labels, such as `pay_in_full` → `full_payment`.
-
-## Testing and help
-
-Tests mock AI/API behavior and use synthetic temporary inputs:
-
-```powershell
-python -m pytest -q
-python -m ruff check .
-python code/main.py --help
-$env:PYTHONPATH = 'code'
-python -m evaluation --help
-python -m evaluation.extraction_experiment --help
-```
-
-## Reference evaluation (offline)
-
-With `PYTHONPATH=code`, evaluate an existing prediction CSV against **provided**
-reference values (replace `data/expected.csv` with your reference path):
-
-```powershell
-python -m evaluation --predictions data/output.csv --expected data/expected.csv
-```
-
-Rows match by `request_id`; duplicate IDs are validation errors. The report shows
-exact accuracy for status, payment method and earliest date, plus Decimal mean
-absolute error and exact accuracy for safe amount. Missing expected fields are
-skipped with visible denominators; missing predictions are mismatches. Money MAE
-uses numeric pairs only. Typed reports contain field-level mismatch details.
-No hidden answers are supplied, and this evaluator does not score plans, spending
-changes or explanation quality.
-
-## Extraction experiment (optional, live and billable)
-
-The independent experiment compares A (current production model) with B (an
-explicit different model), using the same extractor, prompt and schema on seven
-synthetic text cases. It reports schema validity, complete-case accuracy, per-field
-accuracy, malformed responses, unsupported facts, failures and mismatches.
-Canonical sorting ignores source paths/evidence wording; field scoring aligns
-sorted facts without fuzzy matching. Winner priority is case accuracy, mean field
-accuracy, then schema-valid rate, otherwise a tie. It never changes production.
-
-Only run this command if you want live, potentially billable API requests and have
-`OPENAI_API_KEY` configured; replace the placeholder with your chosen model:
-
-```powershell
-python -m evaluation.extraction_experiment --live --alternative-model YOUR_MODEL_ID
-```
-
-Alternatively set `OPENAI_EXPERIMENT_MODEL`. The CLI refuses execution without
-`--live`, a key, and a different explicit alternative. Offline callers can use
-`compare_configurations(model, request=mock_request)`; tests mock both models.
-
-## Safety and failures
-
-- Payment validation protects the higher supplied minimum/preferred reserve across
-  the computed timeline. Successful plans have positive payments totaling the
-  purchase amount; essential expenses and pending payments are never reduced.
-- AI media is untrusted data. Extraction requests strict schema-only JSON and
-  validates it locally; missing fields stay unknown. Uncertain/incomplete facts
-  are excluded from the operational profile. CSV income entries are caller-confirmed.
-- Merge precedence is explicit CSV over confirmed media. Exact duplicates combine
-  provenance; unresolved equal-priority media conflicts are reported and omitted.
-- Missing optional media can continue with structured data. Failed optional files
-  warn; successful extracted facts remain available. Explicit nonblank media
-  references are required context: missing/unsupported/unreadable files, missing
-  keys, API failures, malformed/incomplete/uncertain output or unresolved media
-  conflicts reject that request. A valid empty irrelevant response is permitted.
-- Required-data failures never fabricate decisions. Later independent requests
-  continue; successful rows retain input order. `run_pipeline(...).failures`
-  records rejected requests. The CLI exits 1 for a partial batch, so its CSV may
-  have fewer rows than the input. File/header, duplicate-ID and output-access
-  failures are fatal (CLI exit 2).
-- Only malformed unused `savings_balance` can be skipped with a warning; other
-  malformed constraints/obligations reject the request. Logs use stderr, safe
-  summaries, stages, types and IDs; no raw API bodies, keys or media are logged.
-
-## Limitations and assumptions
-
-### Challenge mode (`--mode challenge`, the default)
-
-- Recurring expenses are **not projected beyond what `financial_events.csv`
-  already lists**: the 90-day forecast only reserves pending/scheduled rows
-  that literally exist in the CSV (plus AI-confirmed amendments/blank-amount
-  fills when `--use-ai-extraction` is on). This is a deliberate, conservative
-  choice ("do not invent unsupported income/expenses") rather than a
-  statistical recurrence detector projecting future instances that have no
-  CSV row and therefore no `event_id` a spending change could reference.
-- The automatic spending-change search (used only when no method is safe
-  without one) only tries enabling **`full_payment` today** by greedily
-  stopping/reducing up to three flexible events, largest-impact first; it does
-  not also search spending changes for `partial_payment` or `installments`.
-- Installment eligibility approximates "months" as `payment_frequency_days *
-  (number_of_payments - 1) <= max_installment_months * 31` (an upper bound so
-  a real month-count is never falsely rejected), and a `payment_method:
-  full_payment` row in `request_payment_options.csv` is not currently used
-  (only `installments` rows are matched).
-- AI extraction (event identity, currency, amount, status, confirmation,
-  cancellation, settlement, amendment, delay, recurrence, flexibility) is
-  implemented and tested against mocks in `tests/test_event_extractor.py` and
-  reconciled deterministically in `tests/test_event_reconciliation.py`, but is
-  opt-in (`--use-ai-extraction`) and was not run for the submitted
-  `output.csv` — see `code/evaluation/usage_report.md` for what that means for
-  the 16 blank-amount events and other event-linked messages/images.
-
-### Legacy mode (`--mode legacy`, the synthetic runner)
-
-- Safe amount is baseline horizon capacity and is **not capped at the purchase
-  amount**. Selection uses a fixed priority: full now, baseline plan, wait,
-  flexible adjustment, then no purchase; it has no concept of the challenge's
-  payment-option matching or deadline-based ranking.
-- Forecasts include dated income once, pending payments, and explicitly dated
-  recurring/essential expenses. Income frequency does not generate further income.
-  Expenses support daily/weekly/monthly/yearly recurrence; unknown schedules never
-  expand. Savings, history, purchases and the separate flexible-expense collection
-  do not add baseline future events; flexible recurring events may be reduced.
-- Undated optional events are not forecast. Today's safe amount includes the
-  starting balance and intermediate events; future payment/date candidates use
-  their date's closing balance while protecting later balances.
-- Money assumes one currency. Extraction has no currency field: explicit currency
-  and signs remain in evidence; unrepresentable negative amounts stay null and
-  uncertain. Source event IDs are not reconstructed for spending-change export.
-- Offline tests verify interfaces and safety invariants, not live model accuracy
-  or a full-dataset run.
+MIT. See [LICENSE](LICENSE).
